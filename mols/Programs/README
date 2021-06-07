@@ -1,0 +1,12 @@
+# Programs
+
+This folder expects these subfolders:
+- mgltools_x86_64Linux2_1.5.6 
+- vina
+- openbabel-3.1.1
+
+MGL tools can be downloaded from https://ccsb.scripps.edu/mgltools/downloads/ (building required)
+
+AutoDock Vina can be downloaded from http://vina.scripps.edu/download.html
+
+OpenBabel can be downloaded from https://github.com/openbabel/openbabel/releases/tag/openbabel-3-1-1 (building required)
