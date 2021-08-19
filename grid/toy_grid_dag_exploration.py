@@ -3,6 +3,7 @@ import copy
 import gzip
 import heapq
 import itertools
+import time
 import os
 import pickle
 from collections import defaultdict
@@ -22,7 +23,7 @@ from backpack.extensions import BatchGrad
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument("--save_path", default='results/12.pkl.gz', type=str)
+parser.add_argument("--save_path", default='results/100.pkl.gz', type=str)
 parser.add_argument("--device", default='cpu', type=str)
 parser.add_argument("--progress", action='store_true')
 parser.add_argument("--seed", default=0, type=int)
@@ -51,16 +52,16 @@ parser.add_argument("--train_to_sample_ratio", default=1, type=float)
 parser.add_argument("--n_train_steps", default=5000, type=int)
 parser.add_argument("--num_empirical_loss", default=200000, type=int,
                     help="Number of samples used to compute the empirical distribution loss")
-parser.add_argument("--do_tracking", default=1, type=int)
+parser.add_argument("--do_tracking", default=0, type=int)
 parser.add_argument("--do_empirical", default=0, type=int)
 # Model
 parser.add_argument("--n_hid", default=256, type=int)
 parser.add_argument("--n_layers", default=2, type=int)
 
 # Env
-parser.add_argument('--func', default='nmodes')
-parser.add_argument("--horizon", default=16, type=int)
-parser.add_argument("--ndim", default=5, type=int)
+parser.add_argument('--func', default='corners') # nmodes
+parser.add_argument("--horizon", default=8, type=int)
+parser.add_argument("--ndim", default=4, type=int)
 
 #parser.add_argument('--func', default='corners')
 #parser.add_argument("--horizon", default=8, type=int)
@@ -394,6 +395,8 @@ class FlowNetAgent:
         self.epsilon = torch.tensor(args.loss_epsilon)
         self.sampling_temperature = torch.tensor(args.sampling_temperature)
         self.random_action_prob = args.random_action_prob
+        self._sampling_temperature = self.sampling_temperature
+        self._random_action_prob = self.random_action_prob
 
         self.reward_exp = beta = args.reward_exp
         self.reward_ramping = args.reward_ramping
@@ -419,6 +422,15 @@ class FlowNetAgent:
 
     def parameters(self):
         return self.model.parameters()
+
+    def set_eval(self, is_eval=True):
+        if is_eval:
+            self.sampling_temperature = 1
+            self.random_action_prob = 0
+        else:
+            self.sampling_temperature = self._sampling_temperature
+            self.random_action_prob = self._random_action_prob
+
 
     def sample_many(self, mbsize, all_visited):
         batch = []
@@ -566,6 +578,69 @@ def compute_empirical_distribution_error(env, visited, beta):
     kl = (true_density * torch.log(estimated_density / true_density)).sum().item()
     return k1, kl
 
+def compute_empirical_distribution_error_np(env, visited):
+    if not len(visited):
+        return 1, 100
+    dimw = (env.horizon ** np.arange(env.ndim))[::-1]
+    td, end_states, true_r = env.true_density()
+    unraveled = (visited * dimw[None, :]).sum(1)
+    counts = np.bincount(unraveled, minlength=env.horizon ** env.ndim)
+    end_indices = (np.int32(end_states) * dimw[None, :]).sum(1)
+    true_density = torch.tensor(td)
+    Z = visited.shape[0]
+    estimated_density = torch.tensor([counts[i] / Z for i in end_indices])
+    k1 = abs(estimated_density - true_density).mean().item()
+    # KL divergence
+    kl = (true_density * torch.log(estimated_density / true_density)).sum().item()
+    return k1, kl
+
+def compute_empirical_distribution_np(env, visited):
+    visited = np.array(visited)
+    dimw = (env.horizon ** np.arange(env.ndim))[::-1]
+    unraveled = (visited * dimw[None, :]).sum(1)
+    counts = np.bincount(unraveled, minlength=env.horizon ** env.ndim)
+
+    all_int_states = np.int32(list(itertools.product(*[list(range(env.horizon))]*env.ndim)))
+    state_mask = np.array([len(env.parent_transitions(s, False)[0]) > 0 or sum(s) == 0
+                           for s in all_int_states])
+    end_states = list(map(tuple,all_int_states[state_mask]))
+    end_indices = (np.int32(end_states) * dimw[None, :]).sum(1)
+    Z = visited.shape[0]
+    estimated_density = torch.tensor([counts[i] / Z for i in end_indices])
+    return estimated_density
+
+def compute_exact_dag_distribution(env, agent, args):
+    stack = [np.zeros(env.ndim, dtype=np.int32)]
+    state_prob = defaultdict(int)
+    state_prob[tuple(stack[0])] = 1
+    end_prob = {}
+    opened = {}
+    softmax = nn.Softmax(1)
+    asd = tqdm(total=env.horizon ** env.ndim, disable=not args.progress)
+    while len(stack):
+        asd.update(1)
+        s = stack.pop(0)
+        p = state_prob[tuple(s)]
+        if s.max() >= env.horizon - 1:
+            end_prob[tuple(s)] = p
+            continue
+        policy = softmax(agent.forward_logits(torch.tensor(env.obs(s))[None]))[0].detach().numpy()
+        end_prob[tuple(s)] = p * policy[-1]
+        for i in range(env.ndim):
+            sp = s + 0
+            sp[i] += 1
+            state_prob[tuple(sp)] += policy[i] * p
+            if tuple(sp) not in opened:
+                opened[tuple(sp)] = 1
+                stack.append(sp)
+    asd.close()
+    all_int_states = np.int32(list(itertools.product(*[list(range(env.horizon))]*env.ndim)))
+    state_mask = (all_int_states == env.horizon-1).sum(1) <= 1
+    distribution = np.float32([
+        end_prob[i] for i in map(tuple,all_int_states[state_mask])])
+    return distribution
+
+
 def main(args):
     args.dev = torch.device(args.device)
     np.random.seed(args.seed)
@@ -632,6 +707,9 @@ def main(args):
             if losses is not None:
                 all_losses.append([i.item() for i in losses])
 
+        if i == args.n_train_steps // 2:
+            middle_distribution = compute_exact_dag_distribution(env, agent, args)
+
         if not i % 100:
             if do_empirical:
                 empirical_distrib_losses.append(
@@ -650,6 +728,10 @@ def main(args):
                     print(*[f'{np.mean([i[j] for i in all_losses[-100:]]):.5f}'
                             for j in range(len(all_losses[0]))])
 
+
+
+    final_distribution = compute_exact_dag_distribution(env, agent, args)
+
     root = os.path.split(args.save_path)[0]
     os.makedirs(root, exist_ok=True)
     pickle.dump(
@@ -658,6 +740,8 @@ def main(args):
          'visited': np.int8(all_visited),
          'emp_dist_loss': empirical_distrib_losses,
          'min_mode_dist': min_mode_distances,
+         'middle_distribution': middle_distribution,
+         'final_distribution': final_distribution,
          'true_d': env.true_density()[0] if do_empirical else None,
          'transitions_trained_on': np.float32(transitions_trained_on),
          'args':args},
