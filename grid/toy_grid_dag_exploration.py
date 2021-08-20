@@ -18,8 +18,12 @@ from torch.distributions.categorical import Categorical
 
 from explo_util.scmsgd import SCMTDProp
 from explo_util.sumtree import SumTree
-from backpack import extend, backpack
-from backpack.extensions import BatchGrad
+
+try:
+    from backpack import extend, backpack
+    from backpack.extensions import BatchGrad
+except ModuleNotFoundError:
+    backpack = None
 
 parser = argparse.ArgumentParser()
 
@@ -276,7 +280,7 @@ class GridEnv:
         traj_rewards = self.func(all_xs)[state_mask]
         # All the states as the agent sees them:
         all_int_obs = np.float32([self.obs(i) for i in all_int_states])
-        print(all_int_obs.shape, a.shape, u.shape, v1.shape, v2.shape)
+        #print(all_int_obs.shape, a.shape, u.shape, v1.shape, v2.shape)
         return all_int_obs, traj_rewards, all_xs, compute_all_probs
 
 def make_mlp(l, act=nn.LeakyReLU(), tail=[]):
@@ -350,6 +354,10 @@ class ReplayBuffer:
                 i = np.random.randint(0, len(parents))
                 a = actions[i]
                 s[a] -= 1
+            else:
+                a = self.env.ndim # the stop action
+            traj[-1].append(tf(self.env.obs(s))[None])
+            traj[-1].append(tf([a]).long())
             # Values for intermediary trajectory states:
             used_stop_action = False
             done = False
@@ -401,10 +409,6 @@ class FlowNetAgent:
         self.reward_exp = beta = args.reward_exp
         self.reward_ramping = args.reward_ramping
         self.reward_ramping_target = tau = args.reward_ramping_target
-        print(beta, tau,
-              min(beta, 1 + (beta - 1) * (0) / tau),
-              min(beta, 1 + (beta - 1) * (500) / tau),
-              min(beta, 1 + (beta - 1) * (1000) / tau))
         if self.reward_ramping == 'none':
             self.transform_reward = lambda r, it: r ** beta
         elif self.reward_ramping == 'linear':
@@ -418,6 +422,8 @@ class FlowNetAgent:
             self.lf_fun = self.learn_from_v_pi_trans
 
     def forward_logits(self, x):
+        if self.bootstrap_style == 'double':
+            return self.model[0](x)[:, :self.n_forward_logits]
         return self.model(x)[:, :self.n_forward_logits]
 
     def parameters(self):
@@ -642,6 +648,7 @@ def compute_exact_dag_distribution(env, agent, args):
 
 
 def main(args):
+    torch.set_num_threads(1)
     args.dev = torch.device(args.device)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)

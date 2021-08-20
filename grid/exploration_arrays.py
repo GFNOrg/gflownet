@@ -13,6 +13,7 @@ def array_aug_18():
     base = {
         'mbsize': 16,
         'n_train_steps': 5000,
+        'objective': 'q_full',
     }
 
     all_hps = (
@@ -41,7 +42,7 @@ def array_aug_18():
          for strat in ['none', 'top_k', 'uniform', 'prioritized']
          # For the n=4;H=16 corners task, the excepted #steps in a trajectory is ~30
          for sample_size in ([base['mbsize'] * 30] if strat in ['uniform', 'prioritized'] else [2,4,8])
-         for bufsize in ([1e6] if strat in ['uniform', 'prioritized'] else [100, 500, 1000])]
+         for bufsize in ([int(5e6)] if strat in ['uniform', 'prioritized'] else [100, 500, 1000])]
     )
 
     count = itertools.count(0)
@@ -49,7 +50,9 @@ def array_aug_18():
         {**base, **hps,
          'learning_rate': lr,
          'seed': seed,
-         'save_path': f'results/array_aug_18/{next(count)}.pkl.gz'}
+         'save_path': f'results/array_aug_18_q/{next(count)}.pkl.gz'}
+        #'save_path': f'results/array_aug_18/{next(count)}.pkl.gz'}
+        for hps in all_hps
         for lr in global_lrs
         for seed in global_seeds]
 
@@ -59,7 +62,14 @@ def run(hps):
     args = main.parser.parse_args()
     for k,v in hps.items():
         setattr(args, k, v)
-    main.main(args)
+    import os
+    if os.path.exists(args.save_path):
+        return
+    try:
+        main.main(args)
+    except Exception as e:
+        print(args)
+        raise e
 
 
 if __name__ == '__main__':

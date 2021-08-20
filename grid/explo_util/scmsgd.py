@@ -1,7 +1,10 @@
 import torch
 import numpy as np
-from backpack import backpack
-from backpack.extensions import BatchGrad
+try:
+    from backpack import backpack
+    from backpack.extensions import BatchGrad
+except ModuleNotFoundError:
+    backpack = None
 
 _verbose = False
 
