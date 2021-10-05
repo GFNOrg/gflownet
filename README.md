@@ -24,5 +24,3 @@ For `rdkit` in particular we found it to be easier to install through (mini)cond
 If you have CUDA 10.1 configured, you can run `pip install -r requirements.txt`. You can also change `requirements.txt` to match your CUDA version. (Replace cu101 to cuXXX, where XXX is your CUDA version).
 
 We compress the 300k molecule dataset for size. To uncompress it, run `cd mols/data/; gunzip docked_mols.h5.gz`.
-
-We omit docking routines since they are part of a separate contribution still to be submitted. These are available on demand, please do reach out to bengioe@gmail.com or mkorablyov@gmail.com.
