@@ -9,4 +9,4 @@ MGL tools can be downloaded from https://ccsb.scripps.edu/mgltools/downloads/ (b
 
 AutoDock Vina can be downloaded from http://vina.scripps.edu/download.html
 
-OpenBabel can be downloaded from https://github.com/openbabel/openbabel/releases/tag/openbabel-3-1-1 (building required)
+OpenBabel can be downloaded from https://github.com/openbabel/openbabel/releases/tag/openbabel-3-1-1 (building required, make sure after the build, the bin folder is in your PATH and lib in LD_LIBRARY_PATH)

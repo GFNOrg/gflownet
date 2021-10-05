@@ -31,7 +31,7 @@ import torch_geometric.nn as gnn
 from torch.distributions.categorical import Categorical
 
 from utils import chem
-
+import ray
 from mol_mdp_ext import MolMDPExtended, BlockMoleculeDataExtended
 
 import model_atom, model_block, model_fingerprint
@@ -436,8 +436,28 @@ def train_generative_model(args, model, proxy, dataset, num_steps=None, do_save=
                             'test_infos': test_infos,
                             'train_infos': train_infos}
 
+@ray.remote
+class _SimDockLet:
+    def __init__(self, tmp_dir):
+        self.dock = chem.DockVina_smi(tmp_dir)
+        self.target_norm = [-8.6, 1.10]
 
-def sample_and_update_dataset(args, model, proxy_dataset, generator_dataset, docker):
+    def eval(self, mol, norm=False):
+        s = "None"
+        try:
+            s = Chem.MolToSmiles(mol.mol)
+            print("docking {}".format(s))
+            _, r, _ = self.dock.dock(s)
+        except Exception as e: # Sometimes the prediction fails
+            print('exception for', s, e)
+            r = 0
+        if not norm:
+            return r
+        reward = -(r-self.target_norm[0])/self.target_norm[1]
+        return reward
+
+
+def sample_and_update_dataset(args, model, proxy_dataset, generator_dataset, dock_pool):
     # generator_dataset.set_sampling_model(model, docker, sample_prob=args.sample_prob)
     # sampler = generator_dataset.start_samplers(8, args.num_samples)
     print("Sampling")
@@ -470,13 +490,20 @@ def sample_and_update_dataset(args, model, proxy_dataset, generator_dataset, doc
             # print('skip', mol.blockidxs, mol.jbonds)
             continue
         # print('here')
-        score = docker.eval(mol, norm=False)
-        mol.reward = proxy_dataset.r2r(score)
+        # score = docker.eval(mol, norm=False)
+        # mol.reward = proxy_dataset.r2r(score)
         # mol.smiles = s
         smis.append(mol.smiles)
-        rews.append(mol.reward)
-        print(mol.smiles, mol.reward)
+        # rews.append(mol.reward)
+        # print(mol.smiles, mol.reward)
         sampled_mols.append(mol)
+    
+    t0 = time.time()
+    rews = list(dock_pool.map(lambda a, m: a.eval.remote(m), sampled_mols))
+    t1 = time.time()
+    print('Docking sim done in {}'.format(t1-t0))
+    for i in range(len(sampled_mols)):
+        sampled_mols[i].reward = rews[i]
 
     print("Computing distances")
     dists =[]
@@ -504,7 +531,9 @@ def main(args):
     reward_norm = args.reward_norm
     rews = []
     smis = []
-    docker = Docker(tmp_dir, cpu_req=args.cpu_req)
+    actors = [_SimDockLet.remote(tmp_dir)
+                    for i in range(10)]
+    pool = ray.util.ActorPool(actors)
     args.repr_type = proxy_repr_type
     args.replay_mode = "dataset"
     args.reward_exp = 1
@@ -548,7 +577,7 @@ def main(args):
 
         print(f"Sampling mols: {i}")
         # sample molecule batch for generator and update dataset with docking scores for sampled batch
-        _proxy_dataset, r, s, batch_metrics = sample_and_update_dataset(args, model, proxy_dataset, gen_model_dataset, docker)
+        _proxy_dataset, r, s, batch_metrics = sample_and_update_dataset(args, model, proxy_dataset, gen_model_dataset, pool)
         print(f"Batch Metrics: dists_mean: {batch_metrics['dists_mean']}, dists_sum: {batch_metrics['dists_sum']}, reward_mean: {batch_metrics['reward_mean']}, reward_max: {batch_metrics['reward_max']}")
         rews.append(r)
         smis.append(s)

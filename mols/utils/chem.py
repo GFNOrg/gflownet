@@ -33,6 +33,14 @@ atomic_numbers = {"H": 1, "He": 2, "Li": 3, "Be": 4, "B": 5, "C": 6, "N": 7, "O"
                   "Zr": 40, "Nb": 41, "Mo": 42, "Tc": 43, "Ru": 44, "Rh": 45, "Pd": 46, "Ag": 47, "Cd": 48, "In": 49, "Sn": 50, "Sb": 51,
                   "Te": 52, "I": 53, "Xe": 54, "Cs": 55, "Ba": 56}
 
+
+def onehot(arr, num_classes, dtype=np.int):
+    arr = np.asarray(arr, dtype=np.int)
+    assert len(arr.shape) ==1, "dims other than 1 not implemented"
+    onehot_arr = np.zeros(arr.shape + (num_classes,), dtype=dtype)
+    onehot_arr[np.arange(arr.shape[0]), arr] = 1
+    return onehot_arr
+
 def mol_from_frag(jun_bonds, frags=None, frag_smis=None, coord=None, optimize=False):
     "joins 2 or more fragments into a single molecule"
     jun_bonds = np.asarray(jun_bonds)
