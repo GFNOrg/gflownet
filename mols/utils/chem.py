@@ -33,6 +33,14 @@ atomic_numbers = {"H": 1, "He": 2, "Li": 3, "Be": 4, "B": 5, "C": 6, "N": 7, "O"
                   "Zr": 40, "Nb": 41, "Mo": 42, "Tc": 43, "Ru": 44, "Rh": 45, "Pd": 46, "Ag": 47, "Cd": 48, "In": 49, "Sn": 50, "Sb": 51,
                   "Te": 52, "I": 53, "Xe": 54, "Cs": 55, "Ba": 56}
 
+
+def onehot(arr, num_classes, dtype=np.int):
+    arr = np.asarray(arr, dtype=np.int)
+    assert len(arr.shape) ==1, "dims other than 1 not implemented"
+    onehot_arr = np.zeros(arr.shape + (num_classes,), dtype=dtype)
+    onehot_arr[np.arange(arr.shape[0]), arr] = 1
+    return onehot_arr
+
 def mol_from_frag(jun_bonds, frags=None, frag_smis=None, coord=None, optimize=False):
     "joins 2 or more fragments into a single molecule"
     jun_bonds = np.asarray(jun_bonds)
@@ -209,3 +217,104 @@ def mol_to_graph_backend(atmfeat, coord, bond, bondfeat, props={}, data_cls=Data
     else:
         data = data_cls(x=atmfeat, edge_index=edge_index, edge_attr=edge_attr, **props)
     return data
+
+class GenMolFile:
+    def __init__(self, outpath, mgltools, mglbin):
+        self.outpath = outpath
+        self.prepare_ligand4 = os.path.join(mgltools, "AutoDockTools/Utilities24/prepare_ligand4.py")
+        self.mglbin = mglbin
+
+        os.makedirs(os.path.join(outpath, "sdf"), exist_ok=True)
+        os.makedirs(os.path.join(outpath, "mol2"), exist_ok=True)
+        os.makedirs(os.path.join(outpath, "pdbqt"), exist_ok=True)
+
+    def __call__(self, smi, mol_name, num_conf):
+        sdf_file = os.path.join(self.outpath, "sdf", f"{mol_name}.sdf")
+        mol2_file = os.path.join(self.outpath, "mol2", f"{mol_name}.mol2")
+        pdbqt_file = os.path.join(self.outpath, "pdbqt", f"{mol_name}.pdbqt")
+
+        mol = Chem.MolFromSmiles(smi)
+        Chem.SanitizeMol(mol)
+        mol_h = Chem.AddHs(mol)
+        AllChem.EmbedMultipleConfs(mol_h, numConfs=num_conf)
+        for i in range(num_conf):
+            AllChem.MMFFOptimizeMolecule(mol_h, confId=i)
+        mp = AllChem.MMFFGetMoleculeProperties(mol_h, mmffVariant='MMFF94')
+        # choose minimum energy conformer
+        mi = np.argmin([AllChem.MMFFGetMoleculeForceField(mol_h, mp, confId=i).CalcEnergy() for i in range(num_conf)])
+        print(Chem.MolToMolBlock(mol_h, confId=int(mi)), file=open(sdf_file, 'w+'))
+        os.system(f"obabel -isdf {sdf_file} -omol2 -O {mol2_file}")
+        os.system(f"{self.mglbin}/pythonsh {self.prepare_ligand4} -l {mol2_file} -o {pdbqt_file}")
+        return pdbqt_file
+
+
+class DockVina_smi:
+    def __init__(self,
+                 outpath,
+                 mgltools_dir=os.path.join("Programs", "mgltools_x86_64Linux2_1.5.6"),
+                 vina_dir=os.path.join("Programs", "vina"),
+                 docksetup_dir=os.path.join("data", "seh/4jnc"),
+                 rec_file="4jnc.nohet.aligned.pdbqt",
+                 bindsite=(-13.4, 26.3, -13.3, 20.013, 16.3, 18.5),
+                 dock_pars="",
+                 cleanup=True):
+
+        self.outpath = outpath
+        self.mgltools = os.path.join(mgltools_dir, "MGLToolsPckgs")
+        self.mgltools_bin = os.path.join(mgltools_dir, "bin")
+        self.vina_bin = os.path.join(vina_dir, "bin/vina")
+        self.rec_file = os.path.join(docksetup_dir, rec_file)
+        self.bindsite = bindsite
+        self.dock_pars = dock_pars
+        self.cleanup = cleanup
+
+        self.gen_molfile = GenMolFile(self.outpath, self.mgltools, self.mgltools_bin)
+        # make vina command
+        self.dock_cmd = "{} --receptor {} " \
+                        "--center_x {} --center_y {} --center_z {} " \
+                        "--size_x {} --size_y {} --size_z {} "
+        self.dock_cmd = self.dock_cmd.format(self.vina_bin, self.rec_file, *self.bindsite)
+        self.dock_cmd += " --ligand {} --out {}"
+
+        os.makedirs(os.path.join(self.outpath, "docked"), exist_ok=True)
+
+    def dock(self, smi, mol_name=None, molgen_conf=20):
+        mol_name = mol_name or ''.join(random.choices(string.ascii_uppercase + string.digits, k=15))
+        docked_file = os.path.join(self.outpath, "docked", f"{mol_name}.pdb")
+        input_file = self.gen_molfile(smi, mol_name, molgen_conf)
+        # complete docking query
+        dock_cmd = self.dock_cmd.format(input_file, docked_file)
+        dock_cmd = dock_cmd + " " + self.dock_pars
+
+        # dock
+        cl = subprocess.Popen(dock_cmd, shell=True, stdout=subprocess.PIPE)
+        cl.wait()
+        # parse energy
+        with open(docked_file) as f:
+            docked_pdb = f.readlines()
+        if docked_pdb[1].startswith("REMARK VINA RESULT"):
+            dockscore = float(docked_pdb[1].split()[3])
+        else:
+            raise Exception("Can't parse docking energy")
+        # parse coordinates
+        # TODO: fix order
+        coord = []
+        endmodel_idx = 0
+        for idx, line in enumerate(docked_pdb):
+            if line.startswith("ENDMDL"):
+                endmodel_idx = idx
+                break
+
+        docked_pdb_model_1 = docked_pdb[:endmodel_idx]  # take only the model corresponding to the best energy
+        docked_pdb_model_1_atoms = [line for line in docked_pdb_model_1 if line.startswith("ATOM")
+                                    and line.split()[2][0] != 'H']  # ignore hydrogen
+        coord.append([line.split()[-7:-4] for line in docked_pdb_model_1_atoms])
+        coord = np.array(coord, dtype=np.float32)
+
+        if self.cleanup:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(os.path.join(self.outpath, "sdf", f"{mol_name}.sdf"))
+                os.remove(os.path.join(self.outpath, "mol2", f"{mol_name}.mol2"))
+                os.remove(os.path.join(self.outpath, "pdbqt", f"{mol_name}.pdbqt"))
+                os.remove(os.path.join(self.outpath, "docked", f"{mol_name}.pdb"))
+        return mol_name, dockscore, coord
