@@ -15,6 +15,9 @@ import torch
 import torch.nn as nn
 from torch.distributions.categorical import Categorical
 import torch.multiprocessing as mp
+import botorch
+from botorch.utils.multi_objective.box_decompositions.dominated import DominatedPartitioning
+from botorch.test_functions.multi_objective import BraninCurrin
 
 parser = argparse.ArgumentParser()
 
@@ -52,21 +55,27 @@ tf = lambda x: torch.FloatTensor(x).to(_dev[0])
 tl = lambda x: torch.LongTensor(x).to(_dev[0])
 
 
-def currin(x):
-    x_0 = x[..., 0] / 2 + 0.5
-    x_1 = x[..., 1] / 2 + 0.5
+def currin(x, nonorm=False):
+    x_0 = x[..., 0] # / 2 + 0.5
+    x_1 = x[..., 1] # / 2 + 0.5
     factor1 = 1 - np.exp(- 1 / (2 * x_1 + 1e-10))
     numer = 2300 * x_0 ** 3 + 1900 * x_0 ** 2 + 2092 * x_0 + 60
     denom = 100 * x_0 ** 3 + 500 * x_0 ** 2 + 4 * x_0 + 20
-    return factor1 * numer / denom / 13.77 # Dividing by the max to help normalize
+    if nonorm:
+        return factor1 * numer / denom
+    else:
+        return np.clip(factor1 * numer / denom, 0, None) / 13.77 # Dividing by the max to help normalize
 
-def branin(x):
+def branin(x, nonorm=False):
     x_0 = 15 * (x[..., 0] / 2 + 0.5) - 5
     x_1 = 15 * (x[..., 1] / 2 + 0.5)
     t1 = (x_1 - 5.1 / (4 * np.pi ** 2) * x_0 ** 2
-          + 5 / np.pi * x_0 - 6)
+          + 5 / np.pi * x_0 - 5)
     t2 = 10 * (1 - 1 / (8 * np.pi)) * np.cos(x_0)
-    return 1 - (t1 ** 2 + t2 + 10) / 308.13 # Dividing by the max to help normalize
+    if nonorm:
+        return 308.13 - (t1 ** 2 + t2 + 10)
+    else:
+        return 1 - (t1 ** 2 + t2 + 10) / 308.13 # Dividing by the max to help normalize
 
 class GridEnv:
 
@@ -286,18 +295,53 @@ def worker(args, agent, events, outq):
                   for i in range(mbs)]
 
     while not stop_event.is_set():
-        data = agent.sample_many(mbs)
+        data = agent.sample_many(mbs)[0]
         losses = agent.learn_from(-1, data) # returns (opt loss, *metrics)
         losses[0].backward()
         outq.put([losses[0].item()] + list(losses[1:]))
         backprop_barrier.wait()
 
+def get_hv(agent, funcs, ref, mbsize, num_samples):
+    # sample points
+    data = []
+    for i in range(num_samples // mbsize):
+        s = tf(np.float32([i.reset(temp=2.)[0] for i in agent.envs]))
+        done = [False] * mbsize
+        while not all(done):
+            cat = Categorical(logits=agent.model(s))
+            acts = cat.sample()
+            ridx = torch.tensor((np.random.uniform(0,1,acts.shape[0]) < 0.01).nonzero()[0])
+            if len(ridx):
+                racts = np.random.randint(0, cat.logits.shape[1], len(ridx))
+                acts[ridx] = torch.tensor(racts)
+            logp = cat.log_prob(acts)
+            step = [i.step(a) for i,a in zip([e for d, e in zip(done, agent.envs) if not d], acts)]
+            p_a = [agent.envs[0].parent_transitions(sp_state, a == agent.ndim)
+                   for a, (sp, r, done, sp_state) in zip(acts, step)]
+            c = count(0)
+            m = {j:next(c) for j in range(mbsize) if not done[j]}
+            done = [bool(d or step[m[i]][2]) for i, d in enumerate(done)]
+            s = tf(np.float32([i[0] for i in step if not i[2]]))
+        for env in agent.envs:
+            data.append(env.s2x(env._state))
+    data = np.array(data)
+    problem = BraninCurrin(negate=True)
+    beval = problem(tf(data))
+    # evaluate points
+    # vals = np.stack([func(data, nonorm=True) for func in funcs])
+    # vals = tf(vals)
+    # import pdb; pdb.set_trace();
+    # compute hypervolume
+    bd = DominatedPartitioning(ref_point=problem.ref_point, Y=beval)
+    volume = bd.compute_hypervolume().item()
+    return volume
+    
         
 def main(args):
     args.dev = torch.device(args.device)
     args.ndim = 2 # Force this for Branin-Currin
     fs = [branin, currin]
-    envs = [GridEnv(args.horizon, args.ndim, funcs=fs)
+    envs = [GridEnv(args.horizon, args.ndim, xrange=[0, 1.], funcs=fs)
             for i in range(args.mbsize)]
     
     agent = FlowNet_TBAgent(args, envs)
@@ -316,7 +360,7 @@ def main(args):
         ([a,1-a], temp)
         for a in np.linspace(0,1,11)
         for temp in [1,2,4,8,16]]
-    test_envs = [GridEnv(args.horizon, args.ndim, funcs=fs)
+    test_envs = [GridEnv(args.horizon, args.ndim, xrange=[0, 1.], funcs=fs)
                  for i in range(len(cond_confs))]
 
     stop_event, backprop_barrier = mp.Event(), mp.Barrier(args.n_mp_procs + 1)
@@ -344,6 +388,8 @@ def main(args):
             for cfg, env in zip(cond_confs, test_envs):
                 env.reset(*cfg)
             distributions.append(compute_exact_dag_distribution(test_envs, agent, args))
+            volume = get_hv(agent, fs, torch.tensor([18.0, 6]), args.mbsize, 5000)
+            print(volume)
         # Workers add to the .grad even if they take the mean of the
         # loss, so let's divide here
         [i.grad.mul_(1 / args.n_mp_procs) for i in agent.parameters()]
