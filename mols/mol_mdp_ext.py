@@ -5,6 +5,7 @@ import numpy as np
 from utils.molMDP import BlockMoleculeData, MolMDP
 import utils.chem as chem
 from rdkit import Chem
+import networkx as nx
 
 import model_atom, model_block, model_fingerprint
 
@@ -235,6 +236,36 @@ class MolMDPExtended(MolMDP):
             r = model_fingerprint.mol2fp(mol, self, self.floatX)
         #self.molcache[molhash] = r
         return r
+
+    def get_nx_graph(self, mol: BlockMoleculeData, true_block=False):
+        true_blockidx = self.true_blockidx
+
+        G = nx.DiGraph()
+        blockidxs = [true_blockidx[xx] for xx in mol.blockidxs] if true_block else mol.blockidxs
+
+        G.add_nodes_from([(ix, {"block": blockidxs[ix]}) for ix in range(len(blockidxs))])
+
+        if len(mol.jbonds) > 0:
+            edges = []
+            for jbond in mol.jbonds:
+                edges.append((jbond[0], jbond[1],
+                              {"bond": [jbond[2], jbond[3]]}))
+                edges.append((jbond[1], jbond[0],
+                              {"bond": [jbond[3], jbond[2]]}))
+            G.add_edges_from(edges)
+        return G
+
+    def graphs_are_isomorphic(self, g1, g2):
+        return nx.algorithms.is_isomorphic(g1, g2, node_match=node_match, edge_match=edge_match)
+
+    
+def node_match(x1, x2):
+    return x1["block"] == x2["block"]
+
+
+def edge_match(x1, x2):
+    return x1["bond"] == x2["bond"]
+
 
 def test_mdp_parent():
     mdp = MolMDPExtended("./data/blocks_PDB_105.json")

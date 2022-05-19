@@ -1,6 +1,4 @@
-
 import numpy as np
-import pandas as pd
 from rdkit import Chem
 from rdkit.Chem import QED
 import torch
@@ -8,6 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data, Batch
 import torch_geometric.nn as gnn
+
+
 
 class GraphAgent(nn.Module):
 
@@ -52,11 +52,10 @@ class GraphAgent(nn.Module):
         if self.version == 'v1' or self.version == 'v3':
             batch_vec = vec_data[graph_data.batch]
             out = self.block2emb(torch.cat([out, batch_vec], 1))
-        elif self.version == 'v2' or self.version == 'v4':
+        else:  # if self.version == 'v2' or self.version == 'v4':
             out = self.block2emb(out)
 
         h = out.unsqueeze(0)
-
         for i in range(self.num_conv_steps):
             m = F.leaky_relu(self.conv(out, graph_data.edge_index, graph_data.edge_attr))
             out, h = self.gru(m.unsqueeze(0).contiguous(), h.contiguous())
@@ -66,8 +65,12 @@ class GraphAgent(nn.Module):
         # stem is a pair [block idx, stem atom type], we need to
         # adjust for the batch packing)
         if do_stems:
+            if hasattr(graph_data, '_slice_dict'):
+                x_slices = torch.tensor(graph_data._slice_dict['x'], device=out.device)[graph_data.stems_batch]
+            else:
+                x_slices = torch.tensor(graph_data.__slices__['x'], device=out.device)[graph_data.stems_batch]
             stem_block_batch_idx = (
-                torch.tensor(graph_data.__slices__['x'], device=out.device)[graph_data.stems_batch]
+                x_slices
                 + graph_data.stems[:, 0])
             if self.version == 'v1' or self.version == 'v4':
                 stem_out_cat = torch.cat([out[stem_block_batch_idx], graph_data.stemtypes], 1)
@@ -102,7 +105,11 @@ class GraphAgent(nn.Module):
         return -self.index_output_by_action(s, stem_lsm, mol_lsm, a)
 
     def index_output_by_action(self, s, stem_o, mol_o, a):
-        stem_slices = torch.tensor(s.__slices__['stems'][:-1], dtype=torch.long, device=stem_o.device)
+        if hasattr(s, '_slice_dict'):
+            stem_slices = torch.tensor(s._slice_dict['stems'][:-1], dtype=torch.long, device=stem_o.device)
+        else:
+            stem_slices = torch.tensor(s.__slices__['stems'][:-1], dtype=torch.long, device=stem_o.device)
+            
         return (
             stem_o[stem_slices + a[:, 1]][
                 torch.arange(a.shape[0]), a[:, 0]] * (a[:, 0] >= 0)
@@ -114,12 +121,12 @@ class GraphAgent(nn.Module):
 def mol2graph(mol, mdp, floatX=torch.float, bonds=False, nblocks=False):
     f = lambda x: torch.tensor(x, dtype=torch.long, device=mdp.device)
     if len(mol.blockidxs) == 0:
-        data = Data(# There's an extra block embedding for the empty molecule
+        data = Data(  # There's an extra block embedding for the empty molecule
             x=f([mdp.num_true_blocks]),
-            edge_index=f([[],[]]),
-            edge_attr=f([]).reshape((0,2)),
-            stems=f([(0,0)]),
-            stemtypes=f([mdp.num_stem_types])) # also extra stem type embedding
+            edge_index=f([[], []]),
+            edge_attr=f([]).reshape((0, 2)),
+            stems=f([(0, 0)]),
+            stemtypes=f([mdp.num_stem_types]))  # also extra stem type embedding
         return data
     edges = [(i[0], i[1]) for i in mol.jbonds]
     #edge_attrs = [mdp.bond_type_offset[i[2]] +  i[3] for i in mol.jbonds]
@@ -144,7 +151,6 @@ def mol2graph(mol, mdp, floatX=torch.float, bonds=False, nblocks=False):
                 stemtypes=f(stemtypes) if len(mol.stems) else f([mdp.num_stem_types]))
     data.to(mdp.device)
     assert not bonds and not nblocks
-    #print(data)
     return data
 
 

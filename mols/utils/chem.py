@@ -13,7 +13,6 @@ from rdkit import rdBase
 from rdkit.Chem import AllChem
 from rdkit.Chem import BRICS
 from rdkit.Chem import ChemicalFeatures
-from rdkit.Chem import Draw
 from rdkit.Chem.Scaffolds import MurckoScaffold
 from rdkit.Chem.rdchem import BondType as BT
 from rdkit.Chem.rdchem import HybridizationType

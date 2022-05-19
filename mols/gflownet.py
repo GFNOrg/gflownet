@@ -1,34 +1,23 @@
 import argparse
-from copy import copy, deepcopy
-from collections import defaultdict
-from datetime import timedelta
-import gc
 import gzip
 import os
-import os.path as osp
-import pickle
-import psutil
 import pdb
-import subprocess
-import sys
+import pickle
 import threading
 import time
-import traceback
 import warnings
-warnings.filterwarnings('ignore')
+from copy import deepcopy
+
+import networkx as nx
 import numpy as np
-import pandas as pd
-from rdkit import Chem
-from rdkit.Chem import QED
-from tqdm import tqdm
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.data import Data, Batch
-import torch_geometric.nn as gnn
 
-from mol_mdp_ext import MolMDPExtended, BlockMoleculeDataExtended
 import model_atom, model_block, model_fingerprint
+from mol_mdp_ext import MolMDPExtended, BlockMoleculeDataExtended
+
+
+warnings.filterwarnings('ignore')
 
 tmp_dir = "/tmp/molexp"
 os.makedirs(tmp_dir, exist_ok=True)
@@ -68,12 +57,38 @@ parser.add_argument("--progress", default='yes')
 parser.add_argument("--floatX", default='float64')
 parser.add_argument("--include_nblocks", default=False)
 parser.add_argument("--balanced_loss", default=True)
-# If True this basically implements Buesing et al's TreeSample Q,
-# samples uniformly from it though, no MTCS involved
-parser.add_argument("--do_wrong_thing", default=False)
+parser.add_argument("--early_stop_reg", default=0.1, type=float)
+parser.add_argument("--initial_log_Z", default=30, type=float)
+parser.add_argument("--objective", default='fm', type=str)
+# If True this basically implements Buesing et al's TreeSample Q/SoftQLearning, samples uniformly
+# from it though, no MCTS involved
+parser.add_argument("--ignore_parents", default=False)
 
 
+@torch.jit.script
+def detailed_balance_loss(P_F, P_B, F, R, traj_lengths):
+    cumul_lens = torch.cumsum(torch.cat([torch.zeros(1, device=traj_lengths.device), traj_lengths]), 0).long()
+    total_loss = torch.zeros(1, device=traj_lengths.device)
+    for ep in range(traj_lengths.shape[0]):
+        offset = cumul_lens[ep]
+        T = int(traj_lengths[ep])
+        for i in range(T):
+            # This flag is False if the endpoint flow of this trajectory is R == F(s_T)
+            flag = float(i + 1 < T)
+            acc = (F[offset + i] - F[offset + min(i + 1, T - 1)] * flag - R[ep] * (1 - flag)
+                   + P_F[offset + i] - P_B[offset + i])
+            total_loss += acc.pow(2)
+    return total_loss
 
+@torch.jit.script
+def trajectory_balance_loss(P_F, P_B, F, R, traj_lengths):
+    cumul_lens = torch.cumsum(torch.cat([torch.zeros(1, device=traj_lengths.device), traj_lengths]), 0).long()
+    total_loss = torch.zeros(1, device=traj_lengths.device)
+    for ep in range(traj_lengths.shape[0]):
+        offset = cumul_lens[ep]
+        T = int(traj_lengths[ep])
+        total_loss += (F[offset] - R[ep] + P_F[offset:offset+T].sum() - P_B[offset:offset+T].sum()).pow(2)
+    return total_loss / float(traj_lengths.shape[0])
 
 
 
@@ -109,7 +124,8 @@ class Dataset:
         self.reward_norm = get('reward_norm', 1)
         self.random_action_prob = get('random_action_prob', 0)
         self.R_min = get('R_min', 1e-8)
-        self.do_wrong_thing = get('do_wrong_thing', False)
+        self.ignore_parents = get('ignore_parents', False)
+        self.early_stop_reg = get('early_stop_reg', 0)
 
         self.online_mols = []
         self.max_online_mols = 1000
@@ -159,6 +175,10 @@ class Dataset:
         m = BlockMoleculeDataExtended()
         samples = []
         max_blocks = self.max_blocks
+        if self.early_stop_reg > 0 and np.random.uniform() < self.early_stop_reg:
+            early_stop_at = np.random.randint(self.min_blocks, self.max_blocks + 1)
+        else:
+            early_stop_at = max_blocks + 1
         trajectory_stats = []
         for t in range(max_blocks):
             s = self.mdp.mols2batch([self.mdp.mol2repr(m)])
@@ -168,14 +188,19 @@ class Dataset:
                 m_o = m_o * 0 - 1000 # prevent assigning prob to stop
                                      # when we can't stop
             ##
-            logits = torch.cat([m_o.reshape(-1), s_o.reshape(-1)])
+            logits = torch.cat([m_o[:, 0].reshape(-1), s_o.reshape(-1)])
+            #print(m_o.shape, s_o.shape, logits.shape)
+            #print(m.blockidxs, m.jbonds, m.stems)
             cat = torch.distributions.Categorical(
                 logits=logits)
             action = cat.sample().item()
+            #print(action)
             if self.random_action_prob > 0 and self.train_rng.uniform() < self.random_action_prob:
                 action = self.train_rng.randint(int(t < self.min_blocks), logits.shape[0])
+            if t == early_stop_at:
+                action = 0
 
-            q = torch.cat([m_o.reshape(-1), s_o.reshape(-1)])
+            q = torch.cat([m_o[:, 0].reshape(-1), s_o.reshape(-1)])
             trajectory_stats.append((q[action].item(), action, torch.logsumexp(q, 0).item()))
             if t >= self.min_blocks and action == 0:
                 r = self._get_reward(m)
@@ -184,6 +209,7 @@ class Dataset:
             else:
                 action = max(0, action-1)
                 action = (action % self.mdp.num_blocks, action // self.mdp.num_blocks)
+                #print('..', action)
                 m_old = m
                 m = self.mdp.add_block_to(m, *action)
                 if len(m.blocks) and not len(m.stems) or t == max_blocks - 1:
@@ -191,13 +217,13 @@ class Dataset:
                     # terminal. Note that this node's parent isn't just m,
                     # because this is a sink for all parent transitions
                     r = self._get_reward(m)
-                    if self.do_wrong_thing:
+                    if self.ignore_parents:
                         samples.append(((m_old,), (action,), r, m, 1))
                     else:
                         samples.append((*zip(*self.mdp.parents(m)), r, m, 1))
                     break
                 else:
-                    if self.do_wrong_thing:
+                    if self.ignore_parents:
                         samples.append(((m_old,), (action,), 0, m, 0))
                     else:
                         samples.append((*zip(*self.mdp.parents(m)), 0, m, 0))
@@ -320,6 +346,27 @@ class Dataset:
             [i.join(0.05) for i in self.sampler_threads]
 
 
+
+class DatasetDirect(Dataset):
+    def sample(self, n):
+        trajectories = [self._get_sample_model() for i in range(n)]
+        batch = (*zip(*sum(trajectories, [])),
+                 sum([[i] * len(t) for i, t in enumerate(trajectories)], []),
+                 [len(t) for t in trajectories])
+        return batch
+
+    def sample2batch(self, mb):
+        s, a, r, sp, d, idc, lens = mb
+        mols = (s, sp)
+        s = self.mdp.mols2batch([self.mdp.mol2repr(i[0]) for i in s])
+        a = torch.tensor(sum(a, ()), device=self._device).long()
+        r = torch.tensor(r, device=self._device).to(self.floatX)
+        d = torch.tensor(d, device=self._device).to(self.floatX)
+        n = torch.tensor([len(self.mdp.parents(m)) for m in sp], device=self._device).to(self.floatX)
+        idc = torch.tensor(idc, device=self._device).long()
+        lens = torch.tensor(lens, device=self._device).long()
+        return (s, a, r, d, n, mols, idc, lens)
+
 def make_model(args, mdp, out_per_mol=1):
     if args.repr_type == 'block_graph':
         model = model_block.GraphAgent(nemb=args.nemb,
@@ -352,8 +399,37 @@ class Proxy:
         self.mdp.post_init(device, eargs.repr_type)
         self.mdp.floatX = args.floatX
         self.proxy = make_model(eargs, self.mdp)
-        for a,b in zip(self.proxy.parameters(), params):
-            a.data = torch.tensor(b, dtype=self.mdp.floatX)
+        # If you get an error when loading the proxy parameters, it is probably due to a version
+        # mismatch in torch geometric. Try uncommenting this code instead of using the
+        # super_hackish_param_map
+        # for a,b in zip(self.proxy.parameters(), params):
+        #    a.data = torch.tensor(b, dtype=self.mdp.floatX)
+        super_hackish_param_map = {
+            'mpnn.lin0.weight': params[0],
+            'mpnn.lin0.bias': params[1],
+            'mpnn.conv.bias': params[3],
+            'mpnn.conv.nn.0.weight': params[4],
+            'mpnn.conv.nn.0.bias': params[5],
+            'mpnn.conv.nn.2.weight': params[6],
+            'mpnn.conv.nn.2.bias': params[7],
+            'mpnn.conv.lin.weight': params[2],
+            'mpnn.gru.weight_ih_l0': params[8],
+            'mpnn.gru.weight_hh_l0': params[9],
+            'mpnn.gru.bias_ih_l0': params[10],
+            'mpnn.gru.bias_hh_l0': params[11],
+            'mpnn.lin1.weight': params[12],
+            'mpnn.lin1.bias': params[13],
+            'mpnn.lin2.weight': params[14],
+            'mpnn.lin2.bias': params[15],
+            'mpnn.set2set.lstm.weight_ih_l0': params[16],
+            'mpnn.set2set.lstm.weight_hh_l0': params[17],
+            'mpnn.set2set.lstm.bias_ih_l0': params[18],
+            'mpnn.set2set.lstm.bias_hh_l0': params[19],
+            'mpnn.lin3.weight': params[20],
+            'mpnn.lin3.bias': params[21],
+        }
+        for k, v in super_hackish_param_map.items():
+            self.proxy.get_parameter(k).data = torch.tensor(v, dtype=self.mdp.floatX)
         self.proxy.to(device)
 
     def __call__(self, m):
@@ -381,12 +457,15 @@ def train_model_with_proxy(args, model, proxy, dataset, num_steps=None, do_save=
 
     dataset.set_sampling_model(model, proxy, sample_prob=args.sample_prob)
 
-    def save_stuff():
+    def save_stuff(iter):
+        corr_logp = compute_correlation(model, dataset.mdp, args)
+        pickle.dump(corr_logp, gzip.open(f'{exp_dir}/{iter}_model_logp_pred.pkl.gz', 'wb'))
+
         pickle.dump([i.data.cpu().numpy() for i in model.parameters()],
-                    gzip.open(f'{exp_dir}/params.pkl.gz', 'wb'))
+                    gzip.open(f'{exp_dir}/' + str(iter) + '_params.pkl.gz', 'wb'))
 
         pickle.dump(dataset.sampled_mols,
-                    gzip.open(f'{exp_dir}/sampled_mols.pkl.gz', 'wb'))
+                    gzip.open(f'{exp_dir}/' + str(iter) + '_sampled_mols.pkl.gz', 'wb'))
 
         pickle.dump({'train_losses': train_losses,
                      'test_losses': test_losses,
@@ -394,16 +473,15 @@ def train_model_with_proxy(args, model, proxy, dataset, num_steps=None, do_save=
                      'time_start': time_start,
                      'time_now': time.time(),
                      'args': args,},
-                    gzip.open(f'{exp_dir}/info.pkl.gz', 'wb'))
+                    gzip.open(f'{exp_dir}/' + str(iter) + '_info.pkl.gz', 'wb'))
 
         pickle.dump(train_infos,
-                    gzip.open(f'{exp_dir}/train_info.pkl.gz', 'wb'))
+                    gzip.open(f'{exp_dir}/' + str(iter) + '_train_info.pkl.gz', 'wb'))
 
 
     opt = torch.optim.Adam(model.parameters(), args.learning_rate, weight_decay=args.weight_decay,
                            betas=(args.opt_beta, args.opt_beta2),
                            eps=args.opt_epsilon)
-
     tf = lambda x: torch.tensor(x, device=device).to(args.floatX)
     tint = lambda x: torch.tensor(x, device=device).long()
 
@@ -412,6 +490,9 @@ def train_model_with_proxy(args, model, proxy, dataset, num_steps=None, do_save=
 
     if not debug_no_threads:
         sampler = dataset.start_samplers(8, mbsize)
+        
+    if args.objective == 'tb':
+        model.logZ = nn.Parameter(tf(args.initial_log_Z))
 
     last_losses = []
 
@@ -443,69 +524,100 @@ def train_model_with_proxy(args, model, proxy, dataset, num_steps=None, do_save=
                     stop_everything()
                     pdb.post_mortem(thread.exception.__traceback__)
                     return
-            p, pb, a, r, s, d, mols = r
+            minibatch = r
         else:
-            p, pb, a, r, s, d, mols = dataset.sample2batch(dataset.sample(mbsize))
-        # Since we sampled 'mbsize' trajectories, we're going to get
-        # roughly mbsize * H (H is variable) transitions
-        ntransitions = r.shape[0]
-        # state outputs
-        if tau > 0:
-            with torch.no_grad():
-                stem_out_s, mol_out_s = target_model(s, None)
+            minibatch = dataset.sample2batch(dataset.sample(mbsize))
+            
+        if args.objective == 'fm':
+            p, pb, a, r, s, d, mols = minibatch
+            # Since we sampled 'mbsize' trajectories, we're going to get
+            # roughly mbsize * H (H is variable) transitions
+            ntransitions = r.shape[0]
+            # state outputs
+            if tau > 0:
+                with torch.no_grad():
+                    stem_out_s, mol_out_s = target_model(s, None)
+            else:
+                stem_out_s, mol_out_s = model(s, None)
+            # parents of the state outputs
+            stem_out_p, mol_out_p = model(p, None)
+            # index parents by their corresponding actions
+            qsa_p = model.index_output_by_action(p, stem_out_p, mol_out_p[:, 0], a)
+            # then sum the parents' contribution, this is the inflow
+            exp_inflow = (torch.zeros((ntransitions,), device=device, dtype=dataset.floatX)
+                          .index_add_(0, pb, torch.exp(qsa_p))) # pb is the parents' batch index
+            inflow = torch.log(exp_inflow + log_reg_c)
+            # sum the state's Q(s,a), this is the outflow
+            exp_outflow = model.sum_output(s, torch.exp(stem_out_s), torch.exp(mol_out_s[:, 0]))
+            # include reward and done multiplier, then take the log
+            # we're guarenteed that r > 0 iff d = 1, so the log always works
+            outflow_plus_r = torch.log(log_reg_c + r + exp_outflow * (1-d))
+            if do_nblocks_reg:
+                losses = _losses = ((inflow - outflow_plus_r) / (s.nblocks * max_blocks)).pow(2)
+            else:
+                losses = _losses = (inflow - outflow_plus_r).pow(2)
+            if clip_loss > 0:
+                ld = losses.detach()
+                losses = losses / ld * torch.minimum(ld, clip_loss)
+
+            term_loss = (losses * d).sum() / (d.sum() + 1e-20)
+            flow_loss = (losses * (1-d)).sum() / ((1-d).sum() + 1e-20)
+            if balanced_loss:
+                loss = term_loss * leaf_coef + flow_loss
+            else:
+                loss = losses.mean()
+            opt.zero_grad()
+            loss.backward(retain_graph=(not i % 50))
+
+            _term_loss = (_losses * d).sum() / (d.sum() + 1e-20)
+            _flow_loss = (_losses * (1-d)).sum() / ((1-d).sum() + 1e-20)
+            last_losses.append((loss.item(), term_loss.item(), flow_loss.item()))
+            train_losses.append((loss.item(), _term_loss.item(), _flow_loss.item(),
+                                 term_loss.item(), flow_loss.item()))
+            if not i % 50:
+                train_infos.append((
+                    _term_loss.data.cpu().numpy(),
+                    _flow_loss.data.cpu().numpy(),
+                    exp_inflow.data.cpu().numpy(),
+                    exp_outflow.data.cpu().numpy(),
+                    r.data.cpu().numpy(),
+                    mols[1],
+                    [i.pow(2).sum().item() for i in model.parameters()],
+                    torch.autograd.grad(loss, qsa_p, retain_graph=True)[0].data.cpu().numpy(),
+                    torch.autograd.grad(loss, stem_out_s, retain_graph=True)[0].data.cpu().numpy(),
+                    torch.autograd.grad(loss, stem_out_p, retain_graph=True)[0].data.cpu().numpy(),
+                ))
+            if args.clip_grad > 0:
+                torch.nn.utils.clip_grad_value_(model.parameters(),
+                                                args.clip_grad)
         else:
+            s, a, r, d, n, mols, idc, lens, *o = minibatch
             stem_out_s, mol_out_s = model(s, None)
-        # parents of the state outputs
-        stem_out_p, mol_out_p = model(p, None)
-        # index parents by their corresponding actions
-        qsa_p = model.index_output_by_action(p, stem_out_p, mol_out_p[:, 0], a)
-        # then sum the parents' contribution, this is the inflow
-        exp_inflow = (torch.zeros((ntransitions,), device=device, dtype=dataset.floatX)
-                      .index_add_(0, pb, torch.exp(qsa_p))) # pb is the parents' batch index
-        inflow = torch.log(exp_inflow + log_reg_c)
-        # sum the state's Q(s,a), this is the outflow
-        exp_outflow = model.sum_output(s, torch.exp(stem_out_s), torch.exp(mol_out_s[:, 0]))
-        # include reward and done multiplier, then take the log
-        # we're guarenteed that r > 0 iff d = 1, so the log always works
-        outflow_plus_r = torch.log(log_reg_c + r + exp_outflow * (1-d))
-        if do_nblocks_reg:
-            losses = _losses = ((inflow - outflow_plus_r) / (s.nblocks * max_blocks)).pow(2)
-        else:
-            losses = _losses = (inflow - outflow_plus_r).pow(2)
-        if clip_loss > 0:
-            ld = losses.detach()
-            losses = losses / ld * torch.minimum(ld, clip_loss)
+            # index parents by their corresponding actions
+            logits = -model.action_negloglikelihood(s, a, 0, stem_out_s, mol_out_s)
+            tzeros = torch.zeros(idc[-1]+1, device=device, dtype=args.floatX)
+            traj_r = tzeros.index_add(0, idc, r)
+            if args.objective == 'tb':
+                uniform_log_PB = tzeros.index_add(0, idc, torch.log(1/n))
+                traj_logits = tzeros.index_add(0, idc, logits)
+                losses = ((model.logZ + traj_logits) - (torch.log(traj_r) + uniform_log_PB)).pow(2)
+                loss = losses.mean()
+            elif args.objective == 'detbal':
+                loss = detailed_balance_loss(logits, torch.log(1/n), mol_out_s[:, 1], torch.log(traj_r), lens)
+            opt.zero_grad()
+            loss.backward()
 
-        term_loss = (losses * d).sum() / (d.sum() + 1e-20)
-        flow_loss = (losses * (1-d)).sum() / ((1-d).sum() + 1e-20)
-        if balanced_loss:
-            loss = term_loss * leaf_coef + flow_loss
-        else:
-            loss = losses.mean()
-        opt.zero_grad()
-        loss.backward(retain_graph=(not i % 50))
-
-        _term_loss = (_losses * d).sum() / (d.sum() + 1e-20)
-        _flow_loss = (_losses * (1-d)).sum() / ((1-d).sum() + 1e-20)
-        last_losses.append((loss.item(), term_loss.item(), flow_loss.item()))
-        train_losses.append((loss.item(), _term_loss.item(), _flow_loss.item(),
-                             term_loss.item(), flow_loss.item()))
-        if not i % 50:
-            train_infos.append((
-                _term_loss.data.cpu().numpy(),
-                _flow_loss.data.cpu().numpy(),
-                exp_inflow.data.cpu().numpy(),
-                exp_outflow.data.cpu().numpy(),
-                r.data.cpu().numpy(),
-                mols[1],
-                [i.pow(2).sum().item() for i in model.parameters()],
-                torch.autograd.grad(loss, qsa_p, retain_graph=True)[0].data.cpu().numpy(),
-                torch.autograd.grad(loss, stem_out_s, retain_graph=True)[0].data.cpu().numpy(),
-                torch.autograd.grad(loss, stem_out_p, retain_graph=True)[0].data.cpu().numpy(),
-            ))
-        if args.clip_grad > 0:
-            torch.nn.utils.clip_grad_value_(model.parameters(),
-                                           args.clip_grad)
+            last_losses.append((loss.item(),))
+            train_losses.append((loss.item(),))
+            if not i % 50:
+                train_infos.append((
+                    r.data.cpu().numpy(),
+                    mols[1],
+                    [i.pow(2).sum().item() for i in model.parameters()],
+                ))
+            if args.clip_grad > 0:
+                torch.nn.utils.clip_grad_value_(model.parameters(),
+                                               args.clip_grad)
         opt.step()
         model.training_steps = i + 1
         if tau > 0:
@@ -520,8 +632,8 @@ def train_model_with_proxy(args, model, proxy, dataset, num_steps=None, do_save=
             time_last_check = time.time()
             last_losses = []
 
-            if not i % 1000 and do_save:
-                save_stuff()
+            if not i % 5000 and do_save:
+                save_stuff(i)
 
     stop_everything()
     if do_save:
@@ -532,18 +644,23 @@ def train_model_with_proxy(args, model, proxy, dataset, num_steps=None, do_save=
 def main(args):
     bpath = "data/blocks_PDB_105.json"
     device = torch.device('cuda')
+    print(args)
 
     if args.floatX == 'float32':
         args.floatX = torch.float
     else:
         args.floatX = torch.double
-    dataset = Dataset(args, bpath, device, floatX=args.floatX)
-    print(args)
+        
+    if args.objective == 'fm':
+        dataset = Dataset(args, bpath, device, floatX=args.floatX)
+    else:
+        args.ignore_parents = True
+        dataset = DatasetDirect(args, bpath, device, floatX=args.floatX)
 
 
     mdp = dataset.mdp
 
-    model = make_model(args, mdp)
+    model = make_model(args, mdp, out_per_mol=1 + (1 if args.objective in ['detbal'] else 0))
     model.to(args.floatX)
     model.to(device)
 
@@ -553,6 +670,124 @@ def main(args):
     print('Done.')
 
 
+
+def get_mol_path_graph(mol):
+    #bpath = "data/blocks_fix_131.json"
+    bpath = "data/blocks_PDB_105.json"
+    mdp = MolMDPExtended(bpath)
+    mdp.post_init(torch.device('cpu'), 'block_graph')
+    mdp.build_translation_table()
+    mdp.floatX = torch.float
+    agraph = nx.DiGraph()
+    agraph.add_node(0)
+    ancestors = [mol]
+    ancestor_graphs = []
+
+    par = mdp.parents(mol)
+    mstack = [i[0] for i in par]
+    pstack = [[0, a] for i,a in par]
+    while len(mstack):
+        m = mstack.pop() #pop = last item is default index
+        p, pa = pstack.pop()
+        match = False
+        mgraph = mdp.get_nx_graph(m)
+        for ai, a in enumerate(ancestor_graphs):
+            if mdp.graphs_are_isomorphic(mgraph, a):
+                agraph.add_edge(p, ai+1, action=pa)
+                match = True
+                break
+        if not match:
+            agraph.add_edge(p, len(ancestors), action=pa) #I assume the original molecule = 0, 1st ancestor = 1st parent = 1
+            ancestors.append(m) #so now len(ancestors) will be 2 --> and the next edge will be to the ancestor labelled 2
+            ancestor_graphs.append(mgraph)
+            if len(m.blocks):
+                par = mdp.parents(m)
+                mstack += [i[0] for i in par]
+                pstack += [(len(ancestors)-1, i[1]) for i in par]
+
+    for u, v in agraph.edges:
+        c = mdp.add_block_to(ancestors[v], *agraph.edges[(u,v)]['action'])
+        geq = mdp.graphs_are_isomorphic(mdp.get_nx_graph(c, true_block=True),
+                                        mdp.get_nx_graph(ancestors[u], true_block=True))
+        if not geq: # try to fix the action
+            block, stem = agraph.edges[(u,v)]['action']
+            for i in range(len(ancestors[v].stems)):
+                c = mdp.add_block_to(ancestors[v], block, i)
+                geq = mdp.graphs_are_isomorphic(mdp.get_nx_graph(c, true_block=True),
+                                                mdp.get_nx_graph(ancestors[u], true_block=True))
+                if geq:
+                    agraph.edges[(u,v)]['action'] = (block, i)
+                    break
+        if not geq:
+            raise ValueError('could not fix action')
+    for u in agraph.nodes:
+        agraph.nodes[u]['mol'] = ancestors[u]
+    return agraph
+    
+
+def compute_correlation(model, mdp, args):
+    device = torch.device('cuda')
+    tf = lambda x: torch.tensor(x, device=device).to(args.floatX)
+    tint = lambda x: torch.tensor(x, device=device).long()
+
+    test_mols = pickle.load(gzip.open('data/some_mols_U_1k.pkl.gz'))
+    logsoftmax = nn.LogSoftmax(0)
+    logp = []
+    reward = []
+    numblocks = []
+    for moli in (test_mols[:1000]):
+        reward.append(np.log(moli[0]))
+        try:
+            agraph = get_mol_path_graph(moli[1])
+        except:
+            continue
+        s = mdp.mols2batch([mdp.mol2repr(agraph.nodes[i]['mol']) for i in agraph.nodes])
+        numblocks.append(len(moli[1].blocks))
+        with torch.no_grad():
+            stem_out_s, mol_out_s = model(s, None)  # get the mols_out_s for ALL molecules not just the end one.
+        per_mol_out = []
+        # Compute pi(a|s)
+        for j in range(len(agraph.nodes)):
+            a,b = s._slice_dict['stems'][j:j+2]
+
+            stop_allowed = len(agraph.nodes[j]['mol'].blocks) >= args.min_blocks
+            mp = logsoftmax(torch.cat([
+                stem_out_s[a:b].reshape(-1),
+                # If num_blocks < min_blocks, the model is not allowed to stop
+                mol_out_s[j, :1] if stop_allowed else tf([-1000])]))
+            per_mol_out.append((mp[:-1].reshape((-1, stem_out_s.shape[1])), mp[-1]))
+
+        # When the model reaches 8 blocks, it is stopped automatically. If instead it stops before
+        # that, we need to take into account the STOP action's logprob
+        if len(moli[1].blocks) < 8:
+            stem_out_last, mol_out_last = model(mdp.mols2batch([mdp.mol2repr(moli[1])]), None)
+            mplast = logsoftmax(torch.cat([stem_out_last.reshape(-1), mol_out_last[0, :1]]))
+            MSTOP = mplast[-1]
+
+        # assign logprob to edges
+        for u,v in agraph.edges:
+            a = agraph.edges[u,v]['action']
+            if a[0] == -1:
+                agraph.edges[u,v]['logprob'] = per_mol_out[v][1]
+            else:
+                agraph.edges[u,v]['logprob'] = per_mol_out[v][0][a[1], a[0]]
+
+        # propagate logprobs through the graph
+        for n in list(nx.topological_sort(agraph))[::-1]: 
+            for c in agraph.predecessors(n): 
+                if len(moli[1].blocks) < 8 and c == 0:
+                    agraph.nodes[c]['logprob'] = torch.logaddexp(
+                        agraph.nodes[c].get('logprob', tf(-1000)),
+                        agraph.edges[c, n]['logprob'] + agraph.nodes[n].get('logprob', 0) + MSTOP)
+                else:
+                    agraph.nodes[c]['logprob'] = torch.logaddexp(
+                        agraph.nodes[c].get('logprob', tf(-1000)),
+                        agraph.edges[c, n]['logprob'] + agraph.nodes[n].get('logprob',0))
+
+        logp.append((moli, agraph.nodes[n]['logprob'].item())) #add the first item
+    return logp
+
+    
 try:
     from arrays import*
 except:
