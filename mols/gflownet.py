@@ -479,11 +479,15 @@ def train_model_with_proxy(args, model, proxy, dataset, num_steps=None, do_save=
                     gzip.open(f'{exp_dir}/' + str(iter) + '_train_info.pkl.gz', 'wb'))
 
 
+    tf = lambda x: torch.tensor(x, device=device).to(args.floatX)
+    tint = lambda x: torch.tensor(x, device=device).long()
+    
+    if args.objective == 'tb':
+        model.logZ = nn.Parameter(tf(args.initial_log_Z))
+
     opt = torch.optim.Adam(model.parameters(), args.learning_rate, weight_decay=args.weight_decay,
                            betas=(args.opt_beta, args.opt_beta2),
                            eps=args.opt_epsilon)
-    tf = lambda x: torch.tensor(x, device=device).to(args.floatX)
-    tint = lambda x: torch.tensor(x, device=device).long()
 
     mbsize = args.mbsize
     ar = torch.arange(mbsize)
