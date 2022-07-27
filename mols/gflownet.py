@@ -494,9 +494,6 @@ def train_model_with_proxy(args, model, proxy, dataset, num_steps=None, do_save=
 
     if not debug_no_threads:
         sampler = dataset.start_samplers(8, mbsize)
-        
-    if args.objective == 'tb':
-        model.logZ = nn.Parameter(tf(args.initial_log_Z))
 
     last_losses = []
 
