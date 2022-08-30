@@ -204,7 +204,7 @@ class Dataset:
             trajectory_stats.append((q[action].item(), action, torch.logsumexp(q, 0).item()))
             if t >= self.min_blocks and action == 0:
                 r = self._get_reward(m)
-                samples.append(((m,), ((-1,0),), r, m, 1))
+                samples.append(((m,), ((-1,0),), r, None, 1))
                 break
             else:
                 action = max(0, action-1)
@@ -362,7 +362,7 @@ class DatasetDirect(Dataset):
         a = torch.tensor(sum(a, ()), device=self._device).long()
         r = torch.tensor(r, device=self._device).to(self.floatX)
         d = torch.tensor(d, device=self._device).to(self.floatX)
-        n = torch.tensor([len(self.mdp.parents(m)) for m in sp], device=self._device).to(self.floatX)
+        n = torch.tensor([len(self.mdp.parents(m)) if (m is not None) else 1 for m in sp], device=self._device).to(self.floatX)
         idc = torch.tensor(idc, device=self._device).long()
         lens = torch.tensor(lens, device=self._device).long()
         return (s, a, r, d, n, mols, idc, lens)
