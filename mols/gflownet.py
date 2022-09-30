@@ -64,6 +64,8 @@ parser.add_argument("--objective", default='fm', type=str)
 # from it though, no MCTS involved
 parser.add_argument("--ignore_parents", default=False)
 
+parser.add_argument("--subtb_lambda", default=0.99, type=float)
+
 
 @torch.jit.script
 def detailed_balance_loss(P_F, P_B, F, R, traj_lengths):
@@ -90,7 +92,24 @@ def trajectory_balance_loss(P_F, P_B, F, R, traj_lengths):
         total_loss += (F[offset] - R[ep] + P_F[offset:offset+T].sum() - P_B[offset:offset+T].sum()).pow(2)
     return total_loss / float(traj_lengths.shape[0])
 
-
+@torch.jit.script
+def tb_lambda_loss(P_F, P_B, F, R, traj_lengths, Lambda):
+    cumul_lens = torch.cumsum(torch.cat([torch.zeros(1, device=traj_lengths.device), traj_lengths]), 0).long()
+    total_loss = torch.zeros(1, device=traj_lengths.device)
+    total_Lambda = torch.zeros(1, device=traj_lengths.device)
+    for ep in range(traj_lengths.shape[0]):
+        offset = cumul_lens[ep]
+        T = int(traj_lengths[ep])
+        for i in range(T):
+            for j in range(i, T):
+                # This flag is False if the endpoint flow of this subtrajectory is R == F(s_T)
+                flag = float(j + 1 < T)
+                acc = F[offset + i] - F[offset + min(j + 1, T - 1)] * flag - R[ep] * (1 - flag)
+                for k in range(i, j + 1):
+                    acc += P_F[offset + k] - P_B[offset + k]
+                total_loss += acc.pow(2) * Lambda ** (j - i + 1)
+                total_Lambda += Lambda ** (j - i + 1)
+    return total_loss / total_Lambda
 
 class Dataset:
 
@@ -481,10 +500,9 @@ def train_model_with_proxy(args, model, proxy, dataset, num_steps=None, do_save=
 
     tf = lambda x: torch.tensor(x, device=device).to(args.floatX)
     tint = lambda x: torch.tensor(x, device=device).long()
-    
     if args.objective == 'tb':
         model.logZ = nn.Parameter(tf(args.initial_log_Z))
-
+        
     opt = torch.optim.Adam(model.parameters(), args.learning_rate, weight_decay=args.weight_decay,
                            betas=(args.opt_beta, args.opt_beta2),
                            eps=args.opt_epsilon)
@@ -494,6 +512,7 @@ def train_model_with_proxy(args, model, proxy, dataset, num_steps=None, do_save=
 
     if not debug_no_threads:
         sampler = dataset.start_samplers(8, mbsize)
+        
 
     last_losses = []
 
@@ -516,6 +535,8 @@ def train_model_with_proxy(args, model, proxy, dataset, num_steps=None, do_save=
     do_nblocks_reg = False
     max_blocks = args.max_blocks
     leaf_coef = args.leaf_coef
+    
+    Lambda = tf([args.subtb_lambda])
 
     for i in range(num_steps):
         if not debug_no_threads:
@@ -605,6 +626,8 @@ def train_model_with_proxy(args, model, proxy, dataset, num_steps=None, do_save=
                 loss = losses.mean()
             elif args.objective == 'detbal':
                 loss = detailed_balance_loss(logits, torch.log(1/n), mol_out_s[:, 1], torch.log(traj_r), lens)
+            elif args.objective == 'subtb':
+                loss = tb_lambda_loss(logits, torch.log(1/n), mol_out_s[:, 1], torch.log(traj_r), lens, Lambda)
             opt.zero_grad()
             loss.backward()
 
@@ -638,7 +661,7 @@ def train_model_with_proxy(args, model, proxy, dataset, num_steps=None, do_save=
 
     stop_everything()
     if do_save:
-        save_stuff()
+        save_stuff(i)
     return model
 
 
@@ -661,7 +684,7 @@ def main(args):
 
     mdp = dataset.mdp
 
-    model = make_model(args, mdp, out_per_mol=1 + (1 if args.objective in ['detbal'] else 0))
+    model = make_model(args, mdp, out_per_mol=1 + (1 if args.objective in ['subtb', 'subtbWS', 'detbal'] else 0))
     model.to(args.floatX)
     model.to(device)
 
